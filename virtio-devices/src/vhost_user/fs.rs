@@ -1,16 +1,19 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::result;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
+use std::{io, result};
 
 use event_monitor::event;
 use log::{error, info};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use serde_with::{Bytes, serde_as};
-use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
+use vhost::vhost_user::message::{
+    VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
+};
 use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler};
 use vm_device::UserspaceMapping;
 use vm_memory::ByteValued;
@@ -24,8 +27,8 @@ use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
 use crate::vhost_user::{VhostUserCommon, VhostUserState};
 use crate::{
-    ActivateResult, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon,
-    VirtioDevice, VirtioDeviceType, VirtioSharedMemoryList,
+    ActivateResult, GuestRegionMmap, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon, VirtioDevice,
+    VirtioDeviceType, VirtioSharedMemoryList,
 };
 
 const NUM_QUEUE_OFFSET: usize = 1;
@@ -33,8 +36,71 @@ const DEFAULT_QUEUE_NUMBER: usize = 2;
 
 pub type State = VhostUserState<VirtioFsConfig>;
 
-struct BackendReqHandler {}
-impl VhostUserFrontendReqHandler for BackendReqHandler {}
+struct BackendReqHandler {
+    mmap_cache_addr: u64,
+    cache_size: u64,
+}
+
+impl VhostUserFrontendReqHandler for BackendReqHandler {
+    fn shmem_map(&self, request: &VhostUserMMap, fd: &dyn AsRawFd) -> io::Result<u64> {
+        self.validate_request(request)?;
+
+        let prot = if request.flags & VhostUserMMapFlags::WRITABLE.bits() != 0 {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+        let addr = self.mmap_cache_addr + request.shm_offset;
+        // SAFETY: The destination range is bounded to the DAX window.
+        let ret = unsafe {
+            libc::mmap(
+                addr as *mut libc::c_void,
+                request.len as usize,
+                prot,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd.as_raw_fd(),
+                request.fd_offset as libc::off_t,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(0)
+    }
+
+    fn shmem_unmap(&self, request: &VhostUserMMap) -> io::Result<u64> {
+        self.validate_request(request)?;
+
+        let addr = self.mmap_cache_addr + request.shm_offset;
+        // SAFETY: The range is bounded to the DAX window, which is checked above. Replacing it with
+        // an anonymous mapping punches a hole back into the window.
+        let ret = unsafe {
+            libc::mmap(
+                addr as *mut libc::c_void,
+                request.len as usize,
+                libc::PROT_NONE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(0)
+    }
+}
+
+impl BackendReqHandler {
+    fn validate_request(&self, request: &VhostUserMMap) -> io::Result<()> {
+        match request.shm_offset.checked_add(request.len) {
+            Some(end) if request.shm_offset < self.cache_size && end <= self.cache_size => Ok(()),
+            _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+}
 
 pub const VIRTIO_FS_TAG_LEN: usize = 36;
 #[serde_as]
@@ -64,7 +130,7 @@ pub struct Fs {
     config: VirtioFsConfig,
     // Hold ownership of the memory that is allocated for the device
     // which will be automatically dropped when the device is dropped
-    cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
+    cache: Option<VirtioSharedMemoryList>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
 }
@@ -78,7 +144,7 @@ impl Fs {
         tag: &str,
         req_num_queues: usize,
         queue_size: u16,
-        cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
+        cache: Option<VirtioSharedMemoryList>,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         access_platform_enabled: bool,
@@ -128,12 +194,17 @@ impl Fs {
             // Filling device and vring features VMM supports.
             let avail_features = DEFAULT_VIRTIO_FEATURES;
 
-            let avail_protocol_features = VhostUserProtocolFeatures::MQ
+            let mut avail_protocol_features = VhostUserProtocolFeatures::MQ
                 | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
                 | VhostUserProtocolFeatures::REPLY_ACK
                 | VhostUserProtocolFeatures::INFLIGHT_SHMFD
                 | VhostUserProtocolFeatures::LOG_SHMFD
                 | VhostUserProtocolFeatures::DEVICE_STATE;
+            if cache.is_some() {
+                avail_protocol_features |= VhostUserProtocolFeatures::BACKEND_REQ
+                    | VhostUserProtocolFeatures::BACKEND_SEND_FD
+                    | VhostUserProtocolFeatures::SHMEM;
+            }
 
             let (acked_features, acked_protocol_features) =
                 vu.negotiate_features_vhost_user(avail_features, avail_protocol_features)?;
@@ -255,7 +326,36 @@ impl VirtioDevice for Fs {
             .virtio_common
             .activate(&queues, Arc::clone(&interrupt_cb))?;
 
-        let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
+        let has_backend_req = self.vu_common.acked_protocol_features
+            & VhostUserProtocolFeatures::BACKEND_REQ.bits()
+            != 0;
+        let backend_req_handler = if has_backend_req {
+            self.cache
+                .as_ref()
+                .map(|cache| {
+                    let mut handler = FrontendReqHandler::new(Arc::new(BackendReqHandler {
+                        mmap_cache_addr: cache.mapping.as_ptr() as u64,
+                        cache_size: cache.mapping.size() as u64,
+                    }))
+                    .map_err(|e| {
+                        crate::ActivateError::VhostUserSetup(Error::FrontendReqHandlerCreation(e))
+                    })?;
+
+                    if self.vu_common.acked_protocol_features
+                        & VhostUserProtocolFeatures::REPLY_ACK.bits()
+                        != 0
+                    {
+                        handler.set_reply_ack_flag(true);
+                    }
+
+                    Ok(handler)
+                })
+                // Return inner Err early, keep Option of `Ok` value.
+                .transpose()?
+        } else {
+            None
+        };
+
         // Run a dedicated thread for handling potential reconnections with
         // the backend.
         let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds()?;
@@ -296,7 +396,7 @@ impl VirtioDevice for Fs {
     }
 
     fn get_shm_regions(&self) -> Option<VirtioSharedMemoryList> {
-        self.cache.as_ref().map(|cache| cache.0.clone())
+        self.cache.clone()
     }
 
     fn set_shm_regions(
@@ -304,7 +404,7 @@ impl VirtioDevice for Fs {
         shm_regions: VirtioSharedMemoryList,
     ) -> result::Result<(), crate::Error> {
         if let Some(cache) = self.cache.as_mut() {
-            cache.0 = shm_regions;
+            *cache = shm_regions;
             Ok(())
         } else {
             Err(crate::Error::SetShmRegionsNotSupported)
@@ -322,9 +422,9 @@ impl VirtioDevice for Fs {
         let mut mappings = Vec::new();
         if let Some(cache) = self.cache.as_ref() {
             mappings.push(UserspaceMapping {
-                mem_slot: cache.0.mem_slot,
-                addr: cache.0.addr,
-                mapping: Arc::clone(&cache.0.mapping),
+                mem_slot: cache.mem_slot,
+                addr: cache.addr,
+                mapping: Arc::clone(&cache.mapping),
                 mergeable: false,
             });
         }
